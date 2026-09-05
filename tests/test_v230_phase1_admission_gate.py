@@ -589,7 +589,7 @@ def test_ingest_fixture_gates_named_regressions_and_keeps_adviseert(tmp_path: Pa
     ]
     djg = _find_by_text(objects, DJG)
     adviseert = _find_by_text(objects, "adviseert de verpleegkundige")
-    one_word = _find_by_text(objects, "Scorelijst")
+    one_word = _find_by_text(objects, "nieuwe scorelijst")
     unresolved = _find_by_text(objects, "tabel 4")
     comparison = _find_by_text(objects, "vaker effectief")
     false_rec = _find_by_text(objects, "komt bij ouderen vaak voor")
@@ -635,14 +635,17 @@ def test_ingest_fixture_gates_named_regressions_and_keeps_adviseert(tmp_path: Pa
     blocked = blocked_audit_lane(objects)
     blocked_texts = [_text_of(obj) for obj in blocked]
     assert DJG in blocked_texts
-    assert any("Scorelijst" in text for text in blocked_texts)
+    assert any("scorelijst" in text for text in blocked_texts)
     assert not any(obj in ordinary for obj in blocked)
 
     client = TestClient(create_console_app(console))
     client.post("/login", data={"username": "researcher.anne", "password": "anne-secret"})
     review = client.get(f"/review?document={receipt['snapshot_id']}").text
-    assert DJG not in review
+    slow = review.split('class="review-lane-slow"', 1)[-1].split("review-blocked-audit", 1)[0]
+    assert DJG not in slow
     assert "adviseert de verpleegkundige" in review
+    assert "review-blocked-audit" in review
+    assert DJG in review.split("review-blocked-audit", 1)[-1]
 
 
 def test_boom_ingest_does_not_apply_richtlijn_contracts(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ from src.object_taxonomy_v1 import (
     recommendation_strength_sentence,
     recommendation_strength_ui_applies,
 )
+from src.admission_gate_v1 import blocked_audit_lane
 from src.operations_console_v1 import (
     ALLOWED_CLASSES,
     ALLOWED_DELETE_NEXT,
@@ -1098,6 +1099,7 @@ def create_console_app(console: OperationsConsole | None = None) -> FastAPI:
                     for obj in remaining_not_duty(snapshot_objects)
                     if obj.get("object_id") not in leftover_ids
                 ]
+                blocked = blocked_audit_lane(snapshot_objects) if review_path != "boom" else []
                 fast_items = "".join(_index_item(obj, checkbox=True) for obj in koppen)
                 slow_items = "".join(_index_item(obj) for obj in duty)
                 leftover_html = ""
@@ -1113,6 +1115,39 @@ def create_console_app(console: OperationsConsole | None = None) -> FastAPI:
                         f'<p class="review-leftover-other">Overige objecten in de store: '
                         f"{len(leftover_other)}. Niet de onderzoekerplicht voor handelingsadvies.</p>"
                     )
+                blocked_html = ""
+                if blocked:
+                    typed = frozenset(
+                        {
+                            "recommendation",
+                            "condition",
+                            "exception",
+                            "definition",
+                            "explanation",
+                        }
+                    )
+                    shown = [
+                        obj
+                        for obj in blocked
+                        if (obj.get("proposed_object_type") or obj.get("confirmed_object_type") or obj.get("object_type"))
+                        in typed
+                    ]
+                    hidden = [obj for obj in blocked if obj not in shown]
+                    blocked_items = "".join(_index_item(obj) for obj in shown)
+                    hidden_ids = " ".join(_esc(obj["object_id"]) for obj in hidden)
+                    hidden_html = (
+                        f'<p class="review-blocked-store-ids">{hidden_ids}</p>' if hidden_ids else ""
+                    )
+                    shown_list = (
+                        f'<ol class="object-index">{blocked_items}</ol>' if blocked_items else ""
+                    )
+                    blocked_html = f"""
+                      <aside class="review-blocked-audit" aria-label="Geblokkeerde kandidaten">
+                        <p>Geblokkeerde kandidaten (poort): {len(blocked)}. Niet de gewone beoordelingsplicht.</p>
+                        {shown_list}
+                        {hidden_html}
+                      </aside>
+                    """
                 if review_path == "boom":
                     fast_title = f"Paden ({len(koppen)})"
                     fast_lead = "Bevestig paden als structuur, nooit als advies."
@@ -1142,6 +1177,7 @@ def create_console_app(console: OperationsConsole | None = None) -> FastAPI:
                       {leftover_html}
                       {other_html}
                     </section>
+                    {blocked_html}
                 """
             else:
                 obj = next((row for row in snapshot_objects if row["object_id"] == chosen_object_id), None)

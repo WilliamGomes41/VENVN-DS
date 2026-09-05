@@ -74,8 +74,15 @@ def canonical_object_payload(obj: dict[str, Any]) -> dict[str, Any]:
         "no_action",
         "metadata",
     ):
-        if extra in obj:
-            payload[extra] = deepcopy(obj.get(extra))
+        if extra not in obj:
+            continue
+        if extra == "metadata":
+            md = deepcopy(obj.get(extra) or {})
+            md.pop("admission", None)
+            if md:
+                payload[extra] = md
+            continue
+        payload[extra] = deepcopy(obj.get(extra))
     return payload
 
 
