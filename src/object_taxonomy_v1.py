@@ -284,6 +284,8 @@ def propose_object_type(text: str, *, is_heading: bool = False) -> str | None:
     if _DEFINITION_RE.search(blob):
         return "definition"
     if _EXCEPTION_RE.search(blob):
+        if _RECOMMENDATION_RE.search(blob):
+            return "recommendation"
         return "exception"
     if _CONDITION_RE.search(blob):
         return "condition"

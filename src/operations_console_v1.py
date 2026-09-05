@@ -23,6 +23,12 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from src.admission_gate_v1 import (
+    GATE_BLOCKED,
+    admission_of,
+    apply_admission_gate,
+    is_admission_blocked,
+)
 from src.atomic_split_v1 import proposed_relations_for_units
 from src.beslisboom_path_v1 import (
     CLOSED_BOOM_TYPES,
@@ -337,6 +343,8 @@ def is_slow_review_duty(obj: dict[str, Any], review_path: str | None = None) -> 
     if obj.get("object_type") == "document":
         return False
     path = review_path or inferred_review_path(obj)
+    if path != "boom" and admission_of(obj).get("gate_result") == GATE_BLOCKED:
+        return False
     if review_lane(obj, review_path=path) == "fast":
         return False
     if requires_four_eyes(obj, confirmed_type=obj.get("confirmed_object_type") or None):
@@ -815,6 +823,8 @@ class OperationsConsole:
             raise ConsoleError("unknown_object")
         if target.get("object_type") == "document":
             raise ConsoleError("unknown_object_type")
+        if is_admission_blocked(target, review_path=review_path):
+            raise ConsoleError("blocked_candidate_not_reviewable")
         self._require_open_original(snapshot_id, object_id)
         if target.get("confirmed_object_type") != confirmed_object_type:
             target["object_version"] = bump_patch(str(target.get("object_version") or "1.0"))
@@ -1113,6 +1123,14 @@ class OperationsConsole:
         objects = transform_generic(spec, manifest, fragments)
         if kind == "boom":
             stamp_boom_flags(objects, fragments)
+        else:
+            objects = apply_admission_gate(
+                objects,
+                klasse=class_,
+                fragments=fragments,
+                document_version=source_version,
+                source_hash=digest,
+            )
         object_diff = None
         if previous:
             object_diff = self._diff_objects(self.snapshot_objects(previous["snapshot_id"]), objects)
@@ -1202,6 +1220,14 @@ class OperationsConsole:
         objects = transform_generic(spec, manifest, fragments)
         if envelope["content_kind"] == "boom":
             stamp_boom_flags(objects, fragments)
+        else:
+            objects = apply_admission_gate(
+                objects,
+                klasse=envelope["class"],
+                fragments=fragments,
+                document_version=envelope["version"],
+                source_hash=envelope["sha256"],
+            )
         envelope["review_passes"] = {}
         envelope["state"] = CAPTURED
         self._envelopes[snapshot_id] = envelope
@@ -1598,7 +1624,14 @@ class OperationsConsole:
                 fragments=fragments,
                 content_kind=envelope["content_kind"],
             )
-            return transform_generic(spec, self._class_change_manifest(envelope), fragments)
+            objects = transform_generic(spec, self._class_change_manifest(envelope), fragments)
+            return apply_admission_gate(
+                objects,
+                klasse=new_class,
+                fragments=fragments,
+                document_version=envelope["version"],
+                source_hash=envelope["sha256"],
+            )
         fragments, spec = self._fragments_and_spec(
             envelope["content_kind"],
             freeze_path,
@@ -1609,7 +1642,14 @@ class OperationsConsole:
             family=envelope["family"],
             class_=new_class,
         )
-        return transform_generic(spec, self._class_change_manifest(envelope), fragments)
+        objects = transform_generic(spec, self._class_change_manifest(envelope), fragments)
+        return apply_admission_gate(
+            objects,
+            klasse=new_class,
+            fragments=fragments,
+            document_version=envelope["version"],
+            source_hash=envelope["sha256"],
+        )
 
     def promote_class(
         self,
@@ -1717,6 +1757,10 @@ class OperationsConsole:
             confirmed = target["confirmed_object_type"]
         apply_type = bool(confirmed_object_type)
         review_path = review_path_for_klasse(envelope["class"])
+        if is_admission_blocked(target, review_path=review_path) and (
+            decision == "approve" or apply_type
+        ):
+            raise ConsoleError("blocked_candidate_not_reviewable")
         if decision == "approve" or apply_type:
             self._require_open_original(snapshot_id, object_id)
         if decision == "approve":
@@ -1905,10 +1949,22 @@ class OperationsConsole:
             revised["object_type"] = "unclassified"
         revised.pop("confirmed_object_type", None)
         stamp_canonical_hashes(revised)
+        envelope = self._envelope(snapshot_id)
+        if review_path_for_klasse(envelope["class"]) != "boom":
+            peers = [
+                revised if row.get("object_id") == object_id else row
+                for row in current
+            ]
+            gated = apply_admission_gate(
+                peers,
+                klasse=envelope["class"],
+                document_version=envelope["version"],
+                source_hash=envelope["sha256"],
+            )
+            revised = next(row for row in gated if row["object_id"] == object_id)
         history = self._load_objects(snapshot_id)
         history.append(revised)
         self._save_objects(snapshot_id, history)
-        envelope = self._envelope(snapshot_id)
         envelope["review_passes"] = {}
         envelope["clinical_rereview_required"] = True
         self._save_envelopes()
