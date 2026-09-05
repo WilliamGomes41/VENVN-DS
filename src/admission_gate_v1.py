@@ -141,6 +141,21 @@ _ADVISEERT_PARSE_RE = re.compile(
 _TE_INF_RE = re.compile(r"\bte\s+\w+\b", re.I)
 _IMPLICIET_RE = re.compile(r"\bimpliciet\b", re.I)
 _LOCATOR_LINES_RE = re.compile(r"lines:(\d+)-(\d+)")
+_DEFINITION_CUE_RE = re.compile(r"\b(?:is een|wordt genoemd|definitie|betekent)\b", re.I)
+
+_LITERAL_CONTRACT_FIELDS = {
+    "recommendation": (
+        "actor_of_scope",
+        "recommended_action",
+        "action_object_or_goal",
+        "recommendation_evidence_span",
+    ),
+    "definition": ("defined_term", "definiens_span"),
+    "condition": ("condition_span",),
+    "exception": ("exception_span",),
+    "factual_finding": ("factual_claim_span",),
+    "explanation": ("support_span",),
+}
 
 
 def serving_type_for_admission_type(proposed_type: str) -> str:
@@ -153,6 +168,12 @@ def admission_of(obj: dict[str, Any]) -> dict[str, Any]:
     md = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
     row = md.get("admission")
     return row if isinstance(row, dict) else {}
+
+
+def is_admission_blocked(obj: dict[str, Any], review_path: str | None = None) -> bool:
+    if review_path == "boom" or is_boom_object(obj):
+        return False
+    return admission_of(obj).get("gate_result") == GATE_BLOCKED
 
 
 def is_boom_object(obj: dict[str, Any]) -> bool:
@@ -194,6 +215,19 @@ def _literal(span: Any, source: str) -> bool:
     if not text:
         return False
     return text in source
+
+
+def _localize_corpus(candidate: dict[str, Any]) -> str:
+    return " ".join(
+        part
+        for part in (
+            str(candidate.get("source_text_exact") or ""),
+            str(candidate.get("candidate_text") or ""),
+            str(candidate.get("context_before") or ""),
+            str(candidate.get("context_after") or ""),
+        )
+        if part
+    )
 
 
 def _present(value: Any) -> bool:
@@ -324,11 +358,17 @@ def _enrich_from_text(candidate: dict[str, Any]) -> None:
         if match:
             candidate["predicate_span"] = match.group(0)
     proposed = candidate.get("proposed_type")
-    if proposed == "definition" and not candidate.get("defined_term"):
-        words = text.split()
-        candidate["defined_term"] = " ".join(words[:3]) if words else ""
+    if proposed == "definition":
+        if not candidate.get("defined_term"):
+            words = text.split()
+            candidate["defined_term"] = " ".join(words[:3]) if words else ""
         if not candidate.get("definiens_span") and " is " in f" {text} ":
             candidate["definiens_span"] = text
+        if not candidate.get("type_evidence_spans"):
+            match = _DEFINITION_CUE_RE.search(text)
+            evidence = match.group(0) if match else str(candidate.get("defined_term") or "")
+            if evidence:
+                candidate["type_evidence_spans"] = [evidence]
     if proposed == "condition":
         if not candidate.get("condition_span"):
             candidate["condition_span"] = text
@@ -417,11 +457,14 @@ def admit_candidate(
         else:
             codes.append("type_contract_incomplete")
 
+    corpus = _localize_corpus(row)
     if not str(row.get("subject_span") or "").strip():
         codes.append("subject_missing")
-    elif source and not _literal(row.get("subject_span"), source) and row.get("subject_span") not in text:
+    elif corpus and not _literal(row.get("subject_span"), corpus):
         codes.append("subject_missing")
     if not str(row.get("predicate_span") or "").strip():
+        codes.append("predicate_missing")
+    elif corpus and not _literal(row.get("predicate_span"), corpus):
         codes.append("predicate_missing")
 
     if _word_count(text) < 3 or not _VERB_RE.search(text):
@@ -434,9 +477,12 @@ def admit_candidate(
     if not start or not end:
         codes.append("locator_invalid")
 
-    evidence = row.get("type_evidence_spans") or []
+    evidence = [span for span in (row.get("type_evidence_spans") or []) if str(span or "").strip()]
     if not evidence:
         codes.append("type_evidence_missing")
+    elif corpus and any(not _literal(span, corpus) for span in evidence):
+        codes.append("type_evidence_missing")
+        codes.append("source_fidelity_failure")
 
     proposed = str(row.get("proposed_type") or "")
     for field in TYPE_CONTRACT_FIELDS.get(proposed, ()):
@@ -450,6 +496,12 @@ def admit_candidate(
                 codes.append("exception_target_missing")
             elif field == "supported_object":
                 codes.append("supported_object_missing")
+            break
+        if field in _LITERAL_CONTRACT_FIELDS.get(proposed, ()) and corpus and not _literal(row.get(field), corpus):
+            codes.append("type_contract_incomplete")
+            codes.append("source_fidelity_failure")
+            if field == "recommendation_evidence_span":
+                codes.append("recommendation_evidence_missing")
             break
 
     if proposed == "recommendation":
@@ -509,6 +561,27 @@ def _object_text(obj: dict[str, Any]) -> str:
     return str((obj.get("content") or {}).get("clean_text") or obj.get("text") or "").strip()
 
 
+def _source_text_exact_for_object(
+    obj: dict[str, Any],
+    fragments_by_id: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    parts: list[str] = []
+    for ref in (obj.get("provenance") or {}).get("source_fragments") or []:
+        frag = (fragments_by_id or {}).get(str(ref.get("raw_object_id") or ""))
+        if not frag:
+            continue
+        raw = str(frag.get("raw_text") or frag.get("clean_text") or "").strip()
+        if raw and raw not in parts:
+            parts.append(raw)
+    if parts:
+        return " ".join(parts)
+    content = obj.get("content") or {}
+    raw = str(content.get("raw_text") or "").strip()
+    if raw:
+        return raw
+    return _object_text(obj)
+
+
 def _neighbor_text(objects: list[dict[str, Any]], index: int, step: int) -> str:
     cursor = index + step
     while 0 <= cursor < len(objects):
@@ -546,8 +619,10 @@ def candidate_from_object(
     index: int,
     document_version: str,
     source_hash: str,
+    fragments_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     text = _object_text(obj)
+    source_exact = _source_text_exact_for_object(obj, fragments_by_id)
     start, end = _locator_bounds(obj)
     proposed = obj.get("proposed_object_type") or ""
     if not proposed and _PREVALENCE_RE.search(text):
@@ -565,7 +640,7 @@ def candidate_from_object(
         "section_path": (obj.get("structure") or {}).get("section_path") or [],
         "source_locator_start": start,
         "source_locator_end": end,
-        "source_text_exact": text,
+        "source_text_exact": source_exact,
         "candidate_text": text,
         "proposed_type": proposed,
         "context_before": _neighbor_text(objects, index, -1),
@@ -593,9 +668,13 @@ def apply_admission_gate(
     document_version: str,
     source_hash: str,
 ) -> list[dict[str, Any]]:
-    del fragments  # Phase 1 uses object neighbors, not a deep freeze window
     if review_path_for_klasse(klasse) == "boom":
         return objects
+    fragments_by_id = {
+        str(fragment.get("fragment_id") or ""): fragment
+        for fragment in (fragments or [])
+        if fragment.get("fragment_id")
+    }
     out: list[dict[str, Any]] = []
     for index, obj in enumerate(objects):
         row = obj
@@ -606,6 +685,7 @@ def apply_admission_gate(
                 index=index,
                 document_version=document_version,
                 source_hash=source_hash,
+                fragments_by_id=fragments_by_id,
             )
             admitted = admit_candidate(candidate)
             row = dict(row)

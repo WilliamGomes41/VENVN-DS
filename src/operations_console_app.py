@@ -107,6 +107,7 @@ ERROR_COPY = {
     "researcher_role_required": "Inleveren vereist de rol researcher.",
     "live_url_html_not_allowed": "Een live HTML-URL kan niet worden ingeleverd. Lever een HTML-bestand of een PDF-URL in.",
     "unknown_object_type": "Kies een type uit de gesloten set.",
+    "blocked_candidate_not_reviewable": "Deze kandidaat is geblokkeerd door de toelatingspoort. Bevestigen of goedkeuren kan niet; revisie of afwijzen blijft mogelijk.",
     "object_type_not_confirmed": "Kies een type uit de gesloten set.",
     "unknown_role": "Alleen researcher, reviewer of publisher zijn toegestaan.",
     "forbidden_reviewer_identity": "Deze identiteit mag niet als reviewer worden aangemaakt.",

@@ -31,8 +31,7 @@ from src.admission_gate_v1 import (
 from src.beslisboom_path_v1 import CLOSED_BOOM_TYPES
 from src.object_taxonomy_v1 import CLOSED_OBJECT_TYPES
 from src.operations_console_app import create_console_app
-from src.operations_console_v1 import OperationsConsole, slow_review_duty
-from src.operations_console_v1 import is_slow_review_duty
+from src.operations_console_v1 import ConsoleError, OperationsConsole, is_slow_review_duty, slow_review_duty
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -513,6 +512,9 @@ def test_recommendation_plus_exception_must_keep_or_link_the_exception() -> None
             source_text_exact=REC_PLUS_EXC,
             candidate_text=REC_PLUS_EXC,
             recommendation_evidence_span=REC_PLUS_EXC,
+            actor_of_scope="De werkgroep",
+            recommended_action="te geven",
+            action_object_or_goal="calcium",
             exceptions_detected=["tenzij er hypercalciëmie bestaat"],
             related_candidates=["cand-exc-hypercalciemie"],
         )
@@ -664,6 +666,162 @@ def test_boom_ingest_does_not_apply_richtlijn_contracts(tmp_path: Path) -> None:
         assert "type_contract_incomplete" not in (admission.get("reason_codes") or [])
     duty = slow_review_duty(objects, review_path="boom")
     assert duty
+
+
+def test_invented_spans_are_source_fidelity_failure() -> None:
+    admitted = admit_candidate(
+        _complete_adviseert_candidate(
+            predicate_span="IMPLIED-VERB",
+            type_evidence_spans=["IMPLIED-EVIDENCE"],
+            actor_of_scope="niet in de bron aanwezige actor",
+            recommended_action="verzinnen",
+            action_object_or_goal="verzonnen doel",
+            recommendation_evidence_span="verzonnen bewijs dat adviseert",
+        )
+    )
+    assert admitted["gate_result"] == GATE_BLOCKED
+    assert "source_fidelity_failure" in admitted["reason_codes"]
+    assert any(
+        code in admitted["reason_codes"]
+        for code in ("predicate_missing", "type_evidence_missing", "type_contract_incomplete")
+    )
+
+
+def test_complete_definition_gets_type_evidence_and_may_be_allowed() -> None:
+    definition = "Continentie is een klinisch onderwerp in de ouderenzorg."
+    admitted = admit_candidate(
+        build_candidate_record(
+            candidate_id="cand-def",
+            document_id="doc-phase1",
+            document_version="1.0",
+            source_hash="a" * 64,
+            section_path=["1 Inleiding"],
+            source_locator_start="lines:10-10",
+            source_locator_end="lines:10-10",
+            source_text_exact=definition,
+            candidate_text=definition,
+            subject_span="Continentie",
+            predicate_span="is",
+            proposed_type="definition",
+            context_before=ADVISEERT,
+            context_after=DJG,
+            defined_term="Continentie",
+            definiens_span=definition,
+        )
+    )
+    assert admitted["type_evidence_spans"]
+    assert all(_text_in_source(span, definition) for span in admitted["type_evidence_spans"])
+    assert admitted["gate_result"] == GATE_ALLOWED
+    assert "type_evidence_missing" not in admitted["reason_codes"]
+
+
+def _text_in_source(span: str, source: str) -> bool:
+    return str(span or "") in source
+
+
+def test_source_text_exact_comes_from_raw_fragment_not_only_clean_text() -> None:
+    dropped = (
+        "De werkgroep adviseert calcium te geven tenzij er hypercalciëmie bestaat."
+    )
+    cleaned = "De werkgroep adviseert calcium te geven."
+    objects = [
+        {
+            "object_id": "rec-drop",
+            "document_id": "doc-phase1",
+            "object_type": "unclassified",
+            "proposed_object_type": "recommendation",
+            "source": {"source_checksum": "c" * 64},
+            "content": {"raw_text": dropped, "clean_text": cleaned},
+            "structure": {"section_path": ["2 Aanbevelingen"]},
+            "metadata": {
+                "source_locator": {
+                    "locator_type": "web_line_range",
+                    "locator_value": "lines:20-20;p:1",
+                }
+            },
+            "provenance": {
+                "source_fragments": [{"raw_object_id": "frag-1"}],
+            },
+        }
+    ]
+    fragments = [{"fragment_id": "frag-1", "raw_text": dropped, "clean_text": cleaned}]
+    stamped = apply_admission_gate(
+        objects,
+        klasse="richtlijn",
+        fragments=fragments,
+        document_version="1.0",
+        source_hash="c" * 64,
+    )
+    admission = _admission(stamped[0])
+    assert admission["source_text_exact"] == dropped
+    assert admission["candidate_text"] == cleaned
+    assert admission["gate_result"] == GATE_BLOCKED
+    assert "source_fidelity_failure" in admission["reason_codes"]
+
+
+def test_blocked_candidate_cannot_be_confirmed_or_approved(tmp_path: Path) -> None:
+    console = _console(tmp_path)
+    accounts = _accounts(console)
+    receipt = _ingest_richtlijn(console, accounts)
+    djg = _find_by_text(console.snapshot_objects(receipt["snapshot_id"]), DJG)
+    with pytest.raises(ConsoleError, match="blocked_candidate_not_reviewable"):
+        console.confirm_object_type(
+            actor_id=accounts["reviewer"]["account_id"],
+            snapshot_id=receipt["snapshot_id"],
+            object_id=djg["object_id"],
+            confirmed_object_type="recommendation",
+        )
+    with pytest.raises(ConsoleError, match="blocked_candidate_not_reviewable"):
+        console.review_object(
+            actor_id=accounts["reviewer"]["account_id"],
+            snapshot_id=receipt["snapshot_id"],
+            object_id=djg["object_id"],
+            decision="approve",
+            confirmed_object_type="recommendation",
+        )
+    rejected = console.review_object(
+        actor_id=accounts["reviewer"]["account_id"],
+        snapshot_id=receipt["snapshot_id"],
+        object_id=djg["object_id"],
+        decision="reject",
+        comment="Geblokkeerde kandidaat; geen aanbeveling.",
+    )
+    row = next(obj for obj in rejected if obj["object_id"] == djg["object_id"])
+    assert row.get("confirmed_object_type") != "recommendation"
+    assert _admission(row).get("gate_result") == GATE_BLOCKED
+
+
+def test_correct_object_reruns_admission_gate(tmp_path: Path) -> None:
+    console = _console(tmp_path)
+    accounts = _accounts(console)
+    receipt = _ingest_richtlijn(console, accounts)
+    adviseert = _find_by_text(
+        console.snapshot_objects(receipt["snapshot_id"]),
+        "adviseert de verpleegkundige",
+    )
+    assert _admission(adviseert)["gate_result"] == GATE_ALLOWED
+    console.review_object(
+        actor_id=accounts["reviewer"]["account_id"],
+        snapshot_id=receipt["snapshot_id"],
+        object_id=adviseert["object_id"],
+        decision="revise",
+        comment="Corrigeer de zin.",
+        proposed_correction=ONE_WORD,
+    )
+    revised = console.correct_object(
+        actor_id=accounts["researcher"]["account_id"],
+        snapshot_id=receipt["snapshot_id"],
+        object_id=adviseert["object_id"],
+        patch={
+            "reason": "reviewer correction",
+            "operations": [
+                {"op": "set", "path": "content.clean_text", "value": ONE_WORD},
+                {"op": "set", "path": "content.raw_text", "value": ONE_WORD},
+            ],
+        },
+    )
+    assert _admission(revised)["gate_result"] == GATE_BLOCKED
+    assert is_slow_review_duty(revised) is False
 
 
 def test_confirm_must_not_write_factual_finding_serving_type(tmp_path: Path) -> None:

@@ -23,7 +23,12 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from src.admission_gate_v1 import GATE_BLOCKED, admission_of, apply_admission_gate
+from src.admission_gate_v1 import (
+    GATE_BLOCKED,
+    admission_of,
+    apply_admission_gate,
+    is_admission_blocked,
+)
 from src.atomic_split_v1 import proposed_relations_for_units
 from src.beslisboom_path_v1 import (
     CLOSED_BOOM_TYPES,
@@ -818,6 +823,8 @@ class OperationsConsole:
             raise ConsoleError("unknown_object")
         if target.get("object_type") == "document":
             raise ConsoleError("unknown_object_type")
+        if is_admission_blocked(target, review_path=review_path):
+            raise ConsoleError("blocked_candidate_not_reviewable")
         self._require_open_original(snapshot_id, object_id)
         if target.get("confirmed_object_type") != confirmed_object_type:
             target["object_version"] = bump_patch(str(target.get("object_version") or "1.0"))
@@ -1750,6 +1757,10 @@ class OperationsConsole:
             confirmed = target["confirmed_object_type"]
         apply_type = bool(confirmed_object_type)
         review_path = review_path_for_klasse(envelope["class"])
+        if is_admission_blocked(target, review_path=review_path) and (
+            decision == "approve" or apply_type
+        ):
+            raise ConsoleError("blocked_candidate_not_reviewable")
         if decision == "approve" or apply_type:
             self._require_open_original(snapshot_id, object_id)
         if decision == "approve":
@@ -1938,10 +1949,22 @@ class OperationsConsole:
             revised["object_type"] = "unclassified"
         revised.pop("confirmed_object_type", None)
         stamp_canonical_hashes(revised)
+        envelope = self._envelope(snapshot_id)
+        if review_path_for_klasse(envelope["class"]) != "boom":
+            peers = [
+                revised if row.get("object_id") == object_id else row
+                for row in current
+            ]
+            gated = apply_admission_gate(
+                peers,
+                klasse=envelope["class"],
+                document_version=envelope["version"],
+                source_hash=envelope["sha256"],
+            )
+            revised = next(row for row in gated if row["object_id"] == object_id)
         history = self._load_objects(snapshot_id)
         history.append(revised)
         self._save_objects(snapshot_id, history)
-        envelope = self._envelope(snapshot_id)
         envelope["review_passes"] = {}
         envelope["clinical_rereview_required"] = True
         self._save_envelopes()
